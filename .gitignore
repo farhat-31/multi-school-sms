@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# builds
+web/dist/
+cloudflare-replica/dist/
+
+# local env & secrets
+.env
+.env.local
+.env.*.local
+.dev.vars
+*.local
+
+# tool caches
+.firebase/
+.wrangler/
+firebase-debug*.log
+firestore-debug.log
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,243 @@
+rules_version = '2';
+
+// ============================================================================
+// Multi-school access model
+// ----------------------------------------------------------------------------
+// Accounts and permissions flow top-down (no self sign-up):
+//   Super Admin  --creates + grants permissions-->  School Admin (+ their school)
+//   School Admin --creates + grants permissions + assigns classes-->  Teacher
+//   Teacher / School Admin --creates-->  FAMILY = student + parent, ONE shared login
+//
+// Families: the login is the parent account (role 'parent', childIds, classIds).
+// Students have no login of their own; choosing "Student" with the family login
+// opens the student portal for those children only.
+//
+// Isolation:
+//   school  - nobody but the Super Admin can reach another school
+//   class   - a teacher only reaches students/attendance/exams/homework/timetable
+//             of the classes assigned to them (users/{uid}.classIds); a family only
+//             reaches its own children's class homework & timetable
+//   family  - parents/students only see their own children's records
+// ============================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Super Admin identities: the built-in "admin" account + allow-listed Google accounts.
+    function isSuperIdentity() {
+      return request.auth.uid == 'y0qEkKBmlBcsn4uZ4Zhfqs87lR73'
+          || (request.auth.token.firebase.sign_in_provider == 'google.com'
+              && request.auth.token.email_verified == true
+              && request.auth.token.email in ['farhatanjumkhan01@gmail.com', 'cloudgcp08@gmail.com']);
+    }
+
+    // ---------- identity helpers ----------
+    // Google sign-in is rejected for everyone except the Super Admin.
+    function signedIn() {
+      return request.auth != null
+          && (request.auth.token.firebase.sign_in_provider != 'google.com' || isSuperIdentity());
+    }
+    function me() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function active() { return signedIn() && me().status == 'active'; }
+    function isSuper() { return signedIn() && isSuperIdentity() && me().role == 'superAdmin' && me().status == 'active'; }
+    function inSchool(s) { return active() && me().get('schoolId', '') == s; }
+    function hasRole(s, r) { return inSchool(s) && me().role == r; }
+    function isSchoolAdmin(s) { return hasRole(s, 'schoolAdmin'); }
+    function isTeacher(s) { return hasRole(s, 'teacher'); }
+    function isStudent(s) { return hasRole(s, 'student'); }
+    function isParent(s) { return hasRole(s, 'parent'); }
+    function isStaff(s) { return isSchoolAdmin(s) || isTeacher(s); }
+    // Permissions the Super Admin grants a School Admin (all on by default).
+    function adminCan(s, perm) { return isSchoolAdmin(s) && me().get('permissions', {}).get(perm, true) == true; }
+    function canManage(s, perm) { return isSuper() || adminCan(s, perm); }
+    // Permissions a School Admin grants a Teacher (all on by default).
+    function teacherCan(s, perm) { return isTeacher(s) && me().get('permissions', {}).get(perm, true) == true; }
+    function myChildIds() { return me().get('childIds', []); }
+    function myClassIds() { return me().get('classIds', []); }
+
+    // ---------- class isolation ----------
+    function teachesClass(s, c) { return isTeacher(s) && c in myClassIds(); }
+    // admin of the school (or super) OR the teacher assigned to class c
+    function staffOfClass(s, c) { return isSuper() || isSchoolAdmin(s) || teachesClass(s, c); }
+    // a family whose child is in class c (or a legacy student account in class c)
+    function familyOfClass(s, c) {
+      return (isParent(s) && c in myClassIds()) || (isStudent(s) && me().get('classId', '') == c);
+    }
+
+    function ownsStudentRecord(s) {
+      return (isStudent(s) && resource.data.studentId == request.auth.uid)
+          || (isParent(s) && resource.data.studentId in myChildIds());
+    }
+    function stampedWith(s) { return request.resource.data.schoolId == s; }
+
+    // Which roles may the caller create / manage inside school s?
+    function canCreateRole(s, r) {
+      return (isSuper() && r in ['schoolAdmin', 'teacher', 'student', 'parent'])
+          || (adminCan(s, 'people') && r in ['teacher', 'student', 'parent'])
+          || (r == 'parent' && teacherCan(s, 'students') && teacherCan(s, 'parents'));
+    }
+    // A teacher may only touch families of their own classes.
+    function familyWithinMyClasses(data) {
+      return data.get('classIds', []).size() > 0 && data.get('classIds', []).hasOnly(myClassIds());
+    }
+
+    // ---------- people ----------
+    match /users/{uid} {
+      allow read: if (signedIn() && request.auth.uid == uid)
+                  || isSuper()
+                  || (resource.data.get('schoolId', '') != '' && isSchoolAdmin(resource.data.schoolId))
+                  // teachers see colleagues, and families of their own classes only
+                  || (resource.data.get('schoolId', '') != '' && isTeacher(resource.data.schoolId)
+                      && (resource.data.role in ['teacher', 'schoolAdmin']
+                          || resource.data.get('classIds', []).hasAny(myClassIds())));
+
+      allow create: if
+        // bootstrap of a Super Admin profile (built-in account or allowed Google account)
+        (signedIn() && uid == request.auth.uid && isSuperIdentity()
+          && request.resource.data.role == 'superAdmin'
+          && request.resource.data.status == 'active')
+        ||
+        // an account created by the level above
+        (request.resource.data.keys().hasOnly(['uid', 'email', 'displayName', 'role', 'schoolId', 'status', 'phone',
+             'classId', 'classIds', 'childIds', 'permissions', 'createdBy', 'createdAt'])
+          && request.resource.data.uid == uid
+          && request.resource.data.status == 'active'
+          && request.resource.data.createdBy == request.auth.uid
+          && request.resource.data.get('childIds', []).size() <= 10
+          && canCreateRole(request.resource.data.schoolId, request.resource.data.role)
+          && (!isTeacher(request.resource.data.schoolId) || familyWithinMyClasses(request.resource.data)));
+
+      allow update: if isSuper()
+        || (signedIn() && uid == request.auth.uid && isSuperIdentity()
+            && request.resource.data.role == 'superAdmin' && request.resource.data.status == 'active')
+        || (
+        resource.data.get('schoolId', '') != ''
+        && canCreateRole(resource.data.schoolId, resource.data.role)
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['displayName', 'phone', 'classId', 'classIds', 'childIds', 'status', 'permissions'])
+        // only a School Admin with 'people' may change a Teacher's permissions or classes
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['permissions'])
+            || (resource.data.role == 'teacher' && adminCan(resource.data.schoolId, 'people')))
+        && request.resource.data.status in ['active', 'disabled']
+        && request.resource.data.get('childIds', []).size() <= 10
+        && (!isTeacher(resource.data.schoolId)
+            || (familyWithinMyClasses(resource.data) && familyWithinMyClasses(request.resource.data)))
+      );
+
+      allow delete: if isSuper()
+        || (resource.data.get('schoolId', '') != '' && canCreateRole(resource.data.schoolId, resource.data.role)
+            && (!isTeacher(resource.data.schoolId) || familyWithinMyClasses(resource.data)));
+    }
+
+    // ---------- schools ----------
+    match /schools/{schoolId} {
+      allow read: if isSuper() || inSchool(schoolId);
+      allow create: if isSuper()
+        && schoolId.matches('school_[a-z0-9_]{1,40}')
+        && request.resource.data.schoolId == schoolId;
+      allow delete: if isSuper();
+      allow update: if isSuper()
+        || (isSchoolAdmin(schoolId)
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['name', 'address', 'phone', 'email', 'website', 'principal', 'logoUrl']));
+
+      // Student profiles (students have no login; their family login is the parent account).
+      match /students/{studentId} {
+        allow read: if isSuper() || isSchoolAdmin(schoolId)
+                    || teachesClass(schoolId, resource.data.classId)
+                    || (isStudent(schoolId) && studentId == request.auth.uid)
+                    || (isParent(schoolId) && studentId in myChildIds());
+        allow create: if stampedWith(schoolId)
+                      && (canManage(schoolId, 'people')
+                          || (teacherCan(schoolId, 'students') && teachesClass(schoolId, request.resource.data.classId)));
+        allow update: if stampedWith(schoolId)
+                      && (canManage(schoolId, 'people')
+                          || (teacherCan(schoolId, 'students')
+                              && teachesClass(schoolId, resource.data.classId)
+                              && teachesClass(schoolId, request.resource.data.classId)));
+        allow delete: if canManage(schoolId, 'people')
+                      || (teacherCan(schoolId, 'students') && teachesClass(schoolId, resource.data.classId));
+      }
+
+      match /teachers/{teacherId} {
+        allow read: if isSuper() || inSchool(schoolId);
+        allow create, update: if canManage(schoolId, 'people') && stampedWith(schoolId);
+        allow delete: if canManage(schoolId, 'people');
+      }
+
+      match /parents/{parentId} {
+        allow read: if isSuper() || isSchoolAdmin(schoolId)
+                    || (isParent(schoolId) && parentId == request.auth.uid)
+                    || (isTeacher(schoolId) && resource.data.get('classIds', []).hasAny(myClassIds()));
+        allow create, update: if stampedWith(schoolId)
+                              && (canManage(schoolId, 'people')
+                                  || (teacherCan(schoolId, 'parents') && familyWithinMyClasses(request.resource.data)
+                                      && (resource == null || familyWithinMyClasses(resource.data))));
+        allow delete: if canManage(schoolId, 'people')
+                      || (teacherCan(schoolId, 'parents') && familyWithinMyClasses(resource.data));
+      }
+
+      match /classes/{classId} {
+        allow read: if isSuper() || inSchool(schoolId);
+        allow create, update: if canManage(schoolId, 'classes') && stampedWith(schoolId);
+        allow delete: if canManage(schoolId, 'classes');
+      }
+
+      match /attendance/{recordId} {
+        allow read: if staffOfClass(schoolId, resource.data.classId) || ownsStudentRecord(schoolId);
+        allow create, update: if stampedWith(schoolId)
+                              && request.resource.data.markedBy == request.auth.uid
+                              && request.resource.data.status in ['present', 'absent', 'late']
+                              && (canManage(schoolId, 'attendance')
+                                  || (teacherCan(schoolId, 'attendance') && teachesClass(schoolId, request.resource.data.classId)));
+        allow delete: if canManage(schoolId, 'attendance');
+      }
+
+      match /fees/{feeId} {
+        allow read: if isSuper() || adminCan(schoolId, 'fees') || ownsStudentRecord(schoolId);
+        allow create, update: if canManage(schoolId, 'fees') && stampedWith(schoolId);
+        allow delete: if canManage(schoolId, 'fees');
+      }
+
+      match /exams/{examId} {
+        allow read: if staffOfClass(schoolId, resource.data.classId) || ownsStudentRecord(schoolId);
+        allow create, update: if stampedWith(schoolId)
+                              && (canManage(schoolId, 'exams')
+                                  || (teacherCan(schoolId, 'exams') && teachesClass(schoolId, request.resource.data.classId)));
+        allow delete: if canManage(schoolId, 'exams');
+      }
+
+      // Weekly timetable per class (managed with the 'classes' permission).
+      match /timetable/{entryId} {
+        allow read: if staffOfClass(schoolId, resource.data.classId) || familyOfClass(schoolId, resource.data.classId);
+        allow create, update: if canManage(schoolId, 'classes') && stampedWith(schoolId);
+        allow delete: if canManage(schoolId, 'classes');
+      }
+
+      // Homework / assignments per class.
+      match /homework/{homeworkId} {
+        allow read: if staffOfClass(schoolId, resource.data.classId) || familyOfClass(schoolId, resource.data.classId);
+        allow create: if stampedWith(schoolId)
+                      && request.resource.data.authorUid == request.auth.uid
+                      && (canManage(schoolId, 'classes')
+                          || (teacherCan(schoolId, 'homework') && teachesClass(schoolId, request.resource.data.classId)));
+        allow update, delete: if canManage(schoolId, 'classes')
+                              || (isTeacher(schoolId) && resource.data.authorUid == request.auth.uid);
+      }
+
+      // School-wide notices.
+      match /announcements/{announcementId} {
+        allow read: if isSuper() || inSchool(schoolId);
+        allow create: if (canManage(schoolId, 'announcements') || teacherCan(schoolId, 'announcements'))
+                      && stampedWith(schoolId)
+                      && request.resource.data.authorUid == request.auth.uid;
+        allow update, delete: if canManage(schoolId, 'announcements')
+                              || (isTeacher(schoolId) && resource.data.authorUid == request.auth.uid);
+      }
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

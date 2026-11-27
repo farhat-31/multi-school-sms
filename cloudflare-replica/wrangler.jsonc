@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "school-replica",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-06-01",
+  "observability": { "enabled": true },
+
+  // One Durable Object instance per school (idFromName(schoolId)).
+  // Each instance has its OWN private SQLite database -> physical isolation.
+  "durable_objects": {
+    "bindings": [{ "name": "SCHOOL_REPLICA", "class_name": "SchoolReplica" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SchoolReplica"] }],
+
+  "vars": {
+    // Must match your Firebase project id (used to verify Firebase ID tokens).
+    "FIREBASE_PROJECT_ID": "farhat-edbc8",
+    // Comma-separated list of web origins allowed to call /api/*.
+    "ALLOWED_ORIGINS": "http://localhost:5173,https://farhat-edbc8.web.app,https://farhat-edbc8.firebaseapp.com"
+  }
+  // No secrets needed: the worker reads Firestore with the caller's own Firebase ID token.
+}

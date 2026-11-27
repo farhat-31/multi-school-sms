@@ -1,0 +1,34 @@
+rules_version = '2';
+
+// Files per school: schools/{schoolId}/shared/** and schools/{schoolId}/students/{studentId}/**
+// Roles come from Firestore users/{uid} (active accounts only).
+service firebase.storage {
+  match /b/{bucket}/o {
+    function me() { return firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data; }
+    function approved() { return request.auth != null && me().status == 'active'; }
+    function isSuper() { return approved() && me().role == 'superAdmin'; }
+    function inSchool(s) { return approved() && me().get('schoolId', '') == s; }
+    function isStaff(s) { return inSchool(s) && me().role in ['schoolAdmin', 'teacher']; }
+    function validUpload() {
+      return request.resource.size < 10 * 1024 * 1024
+          && (request.resource.contentType.matches('image/.*')
+              || request.resource.contentType == 'application/pdf');
+    }
+
+    match /schools/{schoolId}/shared/{allPaths=**} {
+      allow read: if isSuper() || inSchool(schoolId);
+      allow write: if (isSuper() || isStaff(schoolId)) && (request.resource == null || validUpload());
+    }
+
+    match /schools/{schoolId}/students/{studentId}/{allPaths=**} {
+      allow read: if isSuper() || isStaff(schoolId)
+                  || (inSchool(schoolId) && me().role == 'student' && request.auth.uid == studentId)
+                  || (inSchool(schoolId) && me().role == 'parent' && studentId in me().get('childIds', []));
+      allow write: if (isSuper() || isStaff(schoolId)) && (request.resource == null || validUpload());
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
